@@ -51,8 +51,11 @@ def preprocess_patch(patch, transform, target_size=224):
 def adaptive_lane_features(img, x_start, x_end):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h = gray.shape[0]
-    x_s = min(x_start + 4, x_end)
-    x_e = max(x_end   - 4, x_start)
+    # Trim by 4 pixels on each side, but ensure we don't trim more than half the width
+    width = x_end - x_start
+    trim = min(4, max(0, (width - 2) // 2))
+    x_s = x_start + trim
+    x_e = x_end - trim
     lane = gray[:, x_s:x_e]
     lane_w = x_e - x_s
     if lane_w <= 0:
@@ -116,7 +119,7 @@ def detect_lanes(img, expected_lanes=10):
         
     # 3. Scale to height 800 for normalized feature sizes
     scale = 800.0 / h
-    small = cv2.resize(img_temp, None, fx=scale, fy=scale)
+    small = cv2.resize(img_temp, (0, 0), fx=scale, fy=scale)
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
     
     col_means = np.mean(gray, axis=0)
@@ -313,14 +316,19 @@ def main():
             patch_h = 224
             stride = 224
             lane_detections = []
-            y_start = 0
+            cap_margin = int(h * 0.06)
+            y_start = cap_margin
+            y_limit = h - cap_margin
             max_goop = max_skip = 0.0
             
             while True:
-                y_end = min(y_start + patch_h, h)
-                if y_end - y_start < patch_h and y_start > 0:
-                    y_start = max(0, h - patch_h)
-                    y_end = h
+                y_end = min(y_start + patch_h, y_limit)
+                if y_end - y_start < patch_h and y_start > cap_margin:
+                    y_start = max(cap_margin, y_limit - patch_h)
+                    y_end = y_limit
+                
+                if y_end - y_start < 20:
+                    break
                 
                 patch = get_masked_patch(img_clahe, y_start, y_end, x_start, x_end)
                 
@@ -332,11 +340,12 @@ def main():
                         
                         prob_goop = probabilities[1] * 100
                         prob_skip = probabilities[2] * 100
+                        
                         max_goop = max(max_goop, prob_goop)
                         max_skip = max(max_skip, prob_skip)
                         
                         GOOP_THRESHOLD = 5.0
-                        SKIP_THRESHOLD = 17.0
+                        SKIP_THRESHOLD = 55.0
                         
                         if prob_skip > SKIP_THRESHOLD:
                             patch_cls, conf = "skipping", prob_skip
@@ -354,13 +363,13 @@ def main():
                 except Exception as e:
                     print(f"  [WARN] Inference skipped for Lane {lane_idx+1} at Y: {y_start}-{y_end}: {e}")
                 
-                if y_end == h:
+                if y_end == y_limit:
                     break
                 y_start += stride
             
             # Model decision for the lane
             GOOP_THRESHOLD = 5.0
-            SKIP_THRESHOLD = 17.0
+            SKIP_THRESHOLD = 55.0
             if max_skip > SKIP_THRESHOLD:
                 model_cls = "skipping"
             elif max_goop > GOOP_THRESHOLD:
@@ -382,6 +391,14 @@ def main():
             opencv_reliable = lane_bright >= OPENCV_BRIGHT_THRESHOLD
             cr, rcv, mdn = adaptive_lane_features(img, x_start, x_end)
 
+            # 1. Suppress false gooping patch-level detections if OpenCV row-to-row variance is low globally
+            SAFEGUARD_GOOP_CV = 0.09
+            SAFEGUARD_GOOP_DIFF = 0.12
+            if opencv_reliable and (rcv < SAFEGUARD_GOOP_CV and mdn < SAFEGUARD_GOOP_DIFF):
+                lane_detections = [d for d in lane_detections if d['class'] != 'gooping']
+                if model_cls == "gooping":
+                    model_cls = "accepted"
+            
             # Hybrid final classification
             final_cls = model_cls
             if model_cls == "skipping":
